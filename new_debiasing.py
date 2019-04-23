@@ -392,7 +392,7 @@ def main():
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    cache_dir = os.path.join(PYTORCH_PRETRAINED_BERT_CACHE, 'distributed_{}'.format(args.local_rank))
+    cache_dir = os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
     predictor = BertForMultipleChoice.from_pretrained(args.bert_model,
         cache_dir=cache_dir,
         num_choices=4)
@@ -498,38 +498,43 @@ def main():
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids, vp_input_ids, vp_input_mask, protected_attr_ids = batch
-                loss_pred, logits = predictor(input_ids, segment_ids, input_mask, label_ids)
-                max_prob, predicted_vps = torch.max(logits, dim=1)
-                max_prob = (100 * torch.nn.functional.softmax(max_prob)).long().view([-1, 1])
-                # print("predicted_vps: ", predicted_vps)
-                predicted_vps = predicted_vps.view(-1, 1).repeat(1, vp_input_ids.size(2)).view([-1, 1, vp_input_ids.size(2)])
-                vp_input_ids = torch.gather(vp_input_ids, dim=1, index=predicted_vps)
-                vp_input_ids = vp_input_ids.view([vp_input_ids.size(0), -1])
-                vp_input_ids = torch.cat((max_prob, vp_input_ids), dim=1)
-                vp_input_mask = torch.gather(vp_input_mask, dim=1, index=predicted_vps)
-                vp_input_mask = vp_input_mask.view([vp_input_mask.size(0), -1])
-                vp_input_mask = torch.cat((0 * max_prob + 1, vp_input_mask), dim=1)
-                print(vp_input_ids, vp_input_mask)
-                # print(vp_input_ids.shape, vp_input_mask.shape, protected_attr_ids.shape)
-                loss_adv, _ = adversary(vp_input_ids, None, vp_input_mask, protected_attr_ids)
+                loss_pred, logits_pred = predictor(input_ids, segment_ids, input_mask, label_ids)
+                softmax = torch.nn.functional.softmax(logits_pred, dim=1)
+
+                # flatten vp ids and mask
+                batch_size, num_choices = vp_input_ids.shape[0], vp_input_ids.shape[1]
+                vp_input_ids = vp_input_ids.view([batch_size * num_choices, -1])
+                vp_input_mask = vp_input_mask.view([batch_size * num_choices, -1])
+                # repeat protected attribute number of choice times
+                protected_attr_ids_ = protected_attr_ids.repeat(num_choices, 1).t()
+                protected_attr_ids_ = protected_attr_ids_.reshape(-1)
+                loss_adv, logits_adv = adversary(vp_input_ids, None, vp_input_mask, protected_attr_ids_)
+                pos_probs = logits_adv.view([batch_size, num_choices, -1])[:,:,1]
+                # perform a batch-wise dot product between positive probabilities and softmax vector
+                dot_prod = torch.bmm(pos_probs.view([batch_size, 1, num_choices]), softmax.view([batch_size, num_choices, 1])).view([batch_size, 1])
+                loss = torch.nn.CrossEntropyLoss()(torch.cat([1 - dot_prod, dot_prod], dim=1), protected_attr_ids.view([-1]))
+                
                 if n_gpu > 1:
                     loss_pred = loss_pred.mean() # mean() to average on multi-gpu.
                     loss_adv = loss_adv.mean()
+                    loss = loss.mean()
                 if args.fp16 and args.loss_scale != 1.0:
                     # rescale loss for fp16 training
                     # see https://docs.nvidia.com/deeplearning/sdk/mixed-precision-training/index.html
                     loss_pred = loss_pred * args.loss_scale
                     loss_adv = loss_adv * args.loss_scale
+                    loss = loss * args.loss_scale
                 if args.gradient_accumulation_steps > 1:
                     loss_pred = loss_pred / args.gradient_accumulation_steps
                     loss_adv = loss_adv / args.gradient_accumulation_steps
+                    loss = loss / args.gradient_accumulation_steps
                 tr_loss_pred += loss_pred.item()
                 tr_loss_adv += loss_adv.item()
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 
                 training_history.append([loss_pred.item(), loss_adv.item()])
-                loss = loss_pred - alpha * loss_adv
+                loss = loss_pred - alpha * loss
                 if args.fp16:
                     optimizer_pred.backward(loss)
                 else:
