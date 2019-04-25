@@ -1,0 +1,7 @@
+eval_accuracy_adv = 0.7454682779456193
+eval_accuracy_pred = 0.7774061286145878
+eval_loss_adv = 0.5619258344173431
+eval_loss_pred = 0.8226894881190925
+global_step = 3096
+loss_adv = 0.41636152751743793
+loss_pred = 0.1300315124202924
